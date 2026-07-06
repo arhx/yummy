@@ -151,7 +151,7 @@ def main():
     for dub in selected_dubs:
         episodes = groups[dub]
         safe_dub = sanitize_filename(dub)
-        out_dir = os.path.join(safe_title, safe_dub)
+        out_dir = os.path.abspath(os.path.join(safe_title, safe_dub))
         os.makedirs(out_dir, exist_ok=True)
 
         print(f'\n{"="*60}')

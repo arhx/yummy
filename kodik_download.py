@@ -178,14 +178,16 @@ def download_hls(manifest_url: str, output: str, workers: int = 8):
                 seg_path = os.path.join(tmp_dir, f'seg_{i:05d}.ts')
                 f.write(f"file '{seg_path}'\n")
 
-        print(f'  Merging into {output}...')
+        abs_output = os.path.abspath(output)
+        print(f'  Merging...')
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
             '-i', seg_list, '-c', 'copy',
             '-bsf:a', 'aac_adtstoasc',
-            output,
+            abs_output,
         ], capture_output=True)
-        print(f'  Done! -> {output}')
+        size_mb = os.path.getsize(abs_output) / (1024 * 1024)
+        print(f'  Done! {size_mb:.0f} MB -> {abs_output}')
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
