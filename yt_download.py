@@ -9,12 +9,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def run_ytdlp(*args) -> subprocess.CompletedProcess:
-    import shutil
-    cmd = shutil.which('yt-dlp') or shutil.which('yt-dlp.exe')
-    if not cmd:
-        print('ERROR: yt-dlp not found. Install it: pip install yt-dlp')
-        sys.exit(1)
-    return subprocess.run([cmd, *args], capture_output=True, text=True, encoding='utf-8')
+    return subprocess.run([sys.executable, '-m', 'yt_dlp', *args], capture_output=True, text=True, encoding='utf-8')
 
 
 def get_formats_info(url: str) -> str:
