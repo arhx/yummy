@@ -117,6 +117,8 @@ def get_video_links(player_url: str) -> dict:
                 src = source.get('src', '')
                 if '//' not in src:
                     src = rot18_decode(src)
+                if src.startswith('//'):
+                    src = 'https:' + src
                 links[quality] = src
                 break
 
