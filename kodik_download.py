@@ -29,6 +29,7 @@ def rot18_decode(encoded: str) -> str:
         else:
             chars.append(c)
     rotated = ''.join(chars)
+    rotated += '=' * ((4 - len(rotated) % 4) % 4)
     return base64.b64decode(rotated).decode('utf-8')
 
 
