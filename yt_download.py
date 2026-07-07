@@ -45,7 +45,7 @@ def get_playlist_title(url: str) -> str:
 def download_single(url: str, output: str, quality: str = 'best'):
     fmt = build_format(quality)
     cmd = [
-        'yt-dlp',
+        sys.executable, '-m', 'yt_dlp',
         '-f', fmt,
         '--merge-output-format', 'mp4',
         '--no-playlist',
