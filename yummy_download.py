@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 import kodik_download
+import alloha_download
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -41,7 +42,6 @@ def extract_slug(url: str) -> str:
 
 
 def get_anime_id(slug: str) -> tuple[int, str]:
-    """Fetch catalog page and extract anime_id and title from SSR data."""
     url = f'{SITE}/catalog/item/{slug}'
     html = fetch_text(url)
 
@@ -61,33 +61,43 @@ def get_anime_id(slug: str) -> tuple[int, str]:
     return anime_id, title
 
 
-def get_kodik_episodes(anime_id: int) -> dict[str, list[dict]]:
-    """Fetch videos API and group Kodik episodes by dubbing."""
+def detect_player(iframe_url: str) -> str:
+    if 'kodikplayer.com' in iframe_url or 'kodik.info' in iframe_url:
+        return 'kodik'
+    if 'alloha' in iframe_url:
+        return 'alloha'
+    return 'unknown'
+
+
+def get_episodes(anime_id: int) -> dict[str, list[dict]]:
+    """Fetch videos API and group episodes by player+dubbing."""
     url = f'{SITE}/api/anime/{anime_id}/videos'
     data = fetch_json(url)
 
     groups = {}
     for video in data.get('response', []):
         iframe_url = video.get('iframe_url', '')
-        if 'kodikplayer.com' not in iframe_url and 'kodik.info' not in iframe_url:
+        player = detect_player(iframe_url)
+        if player == 'unknown':
             continue
 
         dubbing = video.get('data', {}).get('dubbing', 'Unknown')
         ep_num = video.get('number', '?')
+        key = f'[{player.upper()}] {dubbing}'
 
-        if dubbing not in groups:
-            groups[dubbing] = []
+        if key not in groups:
+            groups[key] = {'player': player, 'dubbing': dubbing, 'episodes': []}
 
         if not iframe_url.startswith('http'):
             iframe_url = 'https:' + iframe_url
 
-        groups[dubbing].append({
+        groups[key]['episodes'].append({
             'episode': ep_num,
             'url': iframe_url,
         })
 
-    for dub in groups:
-        groups[dub].sort(key=lambda e: int(e['episode']) if e['episode'].isdigit() else 0)
+    for key in groups:
+        groups[key]['episodes'].sort(key=lambda e: int(e['episode']) if str(e['episode']).isdigit() else 0)
 
     return groups
 
@@ -96,13 +106,47 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', '_', name)
 
 
+def download_kodik_episode(episode_url: str, output: str, quality: str = None):
+    links = kodik_download.get_video_links(episode_url)
+    if not links:
+        print(f'  No links found')
+        return
+
+    if quality and quality in links:
+        chosen = quality
+    else:
+        chosen = max(links.keys(), key=int)
+
+    url = links[chosen]
+    print(f'  Quality: {chosen}p')
+    kodik_download.download_hls(url, output)
+
+
+def download_alloha_episode(episode_url: str, output: str, quality: str = None, pw_context=None):
+    print(f'  Getting video URLs via browser...')
+    info = alloha_download.get_video_info(episode_url, pw_context=pw_context)
+    if not info:
+        print(f'  ERROR: Could not get video URLs')
+        return
+
+    qualities = info['qualities']
+    if quality and quality in qualities:
+        chosen = quality
+    else:
+        chosen = max(qualities.keys(), key=int)
+
+    print(f'  Quality: {chosen}p')
+    alloha_download.download_video(qualities[chosen], output)
+
+
 def main():
     if len(sys.argv) < 2:
         print('Usage: python yummy_download.py <yummyanime_url> [quality]')
         print()
         print('  yummyanime_url - e.g. https://ru.yummyani.me/catalog/item/mushoku-tensei-iii-...')
-        print('  quality        - 360, 480, 720 (default: best)')
+        print('  quality        - 360, 480, 720 (default: best) [Kodik only]')
         print()
+        print('Supports: Kodik, Alloha players')
         print('The script will show available dubs and let you choose.')
         sys.exit(0)
 
@@ -116,29 +160,30 @@ def main():
     print(f'  ID: {anime_id}')
 
     print(f'\nFetching episodes...')
-    groups = get_kodik_episodes(anime_id)
+    groups = get_episodes(anime_id)
 
     if not groups:
-        print('ERROR: No Kodik episodes found')
+        print('ERROR: No episodes found (Kodik or Alloha)')
         sys.exit(1)
 
-    dubs = sorted(groups.keys())
-    print(f'\nAvailable dubs ({len(dubs)}):')
-    for i, dub in enumerate(dubs, 1):
-        eps = groups[dub]
-        ep_nums = ', '.join(e['episode'] for e in eps)
-        print(f'  {i}. {dub} ({len(eps)} ep: {ep_nums})')
+    keys = sorted(groups.keys())
+    print(f'\nAvailable dubs ({len(keys)}):')
+    for i, key in enumerate(keys, 1):
+        g = groups[key]
+        eps = g['episodes']
+        ep_nums = ', '.join(str(e['episode']) for e in eps)
+        print(f'  {i}. {key} ({len(eps)} ep: {ep_nums})')
 
     print()
     choice = input('Choose dub number (or "all" for all dubs): ').strip()
 
     if choice.lower() == 'all':
-        selected_dubs = dubs
+        selected_keys = keys
     else:
         try:
             idx = int(choice) - 1
-            if 0 <= idx < len(dubs):
-                selected_dubs = [dubs[idx]]
+            if 0 <= idx < len(keys):
+                selected_keys = [keys[idx]]
             else:
                 print('Invalid choice')
                 sys.exit(1)
@@ -148,45 +193,70 @@ def main():
 
     safe_title = sanitize_filename(title)
 
-    for dub in selected_dubs:
-        episodes = groups[dub]
-        safe_dub = sanitize_filename(dub)
-        out_dir = os.path.abspath(os.path.join(safe_title, safe_dub))
-        os.makedirs(out_dir, exist_ok=True)
+    # For Alloha, create shared browser context for efficiency
+    pw_context = None
+    pw = None
+    browser = None
+    has_alloha = any(groups[k]['player'] == 'alloha' for k in selected_keys)
 
-        print(f'\n{"="*60}')
-        print(f'Downloading: {dub} ({len(episodes)} episodes)')
-        print(f'Output dir: {out_dir}')
-        print(f'{"="*60}')
+    if has_alloha:
+        from playwright.sync_api import sync_playwright
+        alloha_download._ensure_wrapper_server()
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(
+            headless=False,
+            channel='chrome',
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--autoplay-policy=no-user-gesture-required',
+            ],
+        )
+        pw_context = browser.new_context(
+            user_agent=HEADERS['User-Agent'],
+            ignore_https_errors=True,
+            viewport={'width': 1280, 'height': 800},
+        )
 
-        for ep in episodes:
-            ep_num = ep['episode']
-            output = os.path.join(out_dir, f'episode_{ep_num.zfill(2)}.mp4')
+    try:
+        for key in selected_keys:
+            g = groups[key]
+            episodes = g['episodes']
+            player = g['player']
+            dubbing = g['dubbing']
+            safe_dub = sanitize_filename(dubbing)
+            out_dir = os.path.abspath(os.path.join(safe_title, safe_dub))
+            os.makedirs(out_dir, exist_ok=True)
 
-            if os.path.exists(output):
-                size_mb = os.path.getsize(output) / (1024 * 1024)
-                if size_mb > 10:
-                    print(f'\n  Episode {ep_num} already exists ({size_mb:.0f} MB), skipping')
+            print(f'\n{"="*60}')
+            print(f'Downloading: {key} ({len(episodes)} episodes)')
+            print(f'Output dir: {out_dir}')
+            print(f'{"="*60}')
+
+            for ep in episodes:
+                ep_num = str(ep['episode'])
+                output = os.path.join(out_dir, f'episode_{ep_num.zfill(2)}.mp4')
+
+                if os.path.exists(output):
+                    size_mb = os.path.getsize(output) / (1024 * 1024)
+                    if size_mb > 10:
+                        print(f'\n  Episode {ep_num} already exists ({size_mb:.0f} MB), skipping')
+                        continue
+
+                print(f'\n--- Episode {ep_num} [{player.upper()}] ---')
+                try:
+                    if player == 'kodik':
+                        download_kodik_episode(ep['url'], output, quality)
+                    elif player == 'alloha':
+                        download_alloha_episode(ep['url'], output, quality=quality, pw_context=pw_context)
+                except Exception as e:
+                    print(f'  ERROR downloading episode {ep_num}: {e}')
                     continue
-
-            print(f'\n--- Episode {ep_num} ---')
-            try:
-                links = kodik_download.get_video_links(ep['url'])
-                if not links:
-                    print(f'  No links for episode {ep_num}')
-                    continue
-
-                if quality and quality in links:
-                    chosen = quality
-                else:
-                    chosen = max(links.keys(), key=int)
-
-                url = links[chosen]
-                print(f'  Quality: {chosen}p')
-                kodik_download.download_hls(url, output)
-            except Exception as e:
-                print(f'  ERROR downloading episode {ep_num}: {e}')
-                continue
+    finally:
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
 
     print(f'\n\nAll done!')
 
