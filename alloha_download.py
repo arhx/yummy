@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import subprocess
 import time
@@ -39,10 +40,37 @@ def _ensure_wrapper_server():
     threading.Thread(target=_wrapper_server.serve_forever, daemon=True).start()
 
 
-def get_video_info(iframe_url: str, pw_context=None) -> dict | None:
+def _norm_tokens(s: str) -> set:
+    return set(re.findall(r'\w+', s.lower()))
+
+
+def _pick_source(sources: list, dub_hint: str | None) -> dict:
+    """Select the hlsSource matching the requested dubbing.
+
+    Alloha returns several audio tracks (requested dub, other dubs, original) in
+    one bnsi response. The requested translation is normally first, but match by
+    label when we have a hint so we never fall back to the original audio.
+    """
+    if not sources:
+        return {}
+    if dub_hint:
+        want = _norm_tokens(dub_hint)
+        best, best_score = None, 0
+        for src in sources:
+            score = len(want & _norm_tokens(src.get('label', '')))
+            if score > best_score:
+                best, best_score = src, score
+        if best is not None:
+            return best
+    return sources[0]
+
+
+def get_video_info(iframe_url: str, pw_context=None, dub_hint: str | None = None) -> dict | None:
     """Load Alloha iframe in Playwright, intercept bnsi response, return video URLs by quality.
 
-    Returns dict: {'qualities': {'1080': url, '720': url, ...}, 'skip_time': '...'} or None.
+    Returns dict: {'qualities': {'1080': [url, ...], ...}, 'label': '...', 'skip_time': '...'}
+    or None. Each quality maps to a LIST of candidate CDN URLs (vkvideo returns
+    several hosts joined by ' or '); try them in order to survive 403s.
     """
     import json
     from playwright.sync_api import sync_playwright
@@ -91,13 +119,15 @@ def get_video_info(iframe_url: str, pw_context=None) -> dict | None:
             body = bnsi_resp.body()
             data = json.loads(body.decode('utf-8'))
 
+            src = _pick_source(data.get('hlsSource', []), dub_hint)
             qualities = {}
-            for src in data.get('hlsSource', []):
-                for res, urls_str in src.get('quality', {}).items():
-                    url = urls_str.split(' or ')[0]
-                    qualities[res.rstrip('p')] = url
+            for res, urls_str in src.get('quality', {}).items():
+                urls = [u.strip() for u in urls_str.split(' or ') if u.strip()]
+                if urls:
+                    qualities[res.rstrip('p')] = urls
 
             result['qualities'] = qualities
+            result['label'] = src.get('label', '')
             result['skip_time'] = data.get('skipTime', '')
         except Exception as e:
             print(f'  Error parsing bnsi response: {e}')
@@ -113,36 +143,52 @@ def get_video_info(iframe_url: str, pw_context=None) -> dict | None:
     return result if result.get('qualities') else None
 
 
-def download_video(m3u8_url: str, output: str):
-    """Download video from m3u8 URL using ffmpeg."""
-    abs_output = os.path.abspath(output)
+def _ffmpeg_download(m3u8_url: str, abs_output: str) -> tuple[bool, str]:
     cmd = [
         'ffmpeg', '-y',
         '-user_agent', UA,
         '-referer', 'https://alloha.yani.tv/',
         '-headers', 'Origin: https://alloha.yani.tv\r\n',
-        '-fflags', '+igndts',
         '-i', m3u8_url,
+        '-map', '0',
         '-c', 'copy',
         '-bsf:a', 'aac_adtstoasc',
+        '-avoid_negative_ts', 'make_zero',
         '-max_muxing_queue_size', '9999',
         abs_output,
     ]
-
-    print(f'  Downloading with ffmpeg...')
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    return proc.returncode == 0, (proc.stderr or '')
 
-    if proc.returncode != 0:
-        stderr_tail = proc.stderr[-600:] if proc.stderr else ''
-        print(f'  ffmpeg error: {stderr_tail}')
-        return False
 
-    if os.path.exists(abs_output):
-        size_mb = os.path.getsize(abs_output) / (1024 * 1024)
-        print(f'  Done! {size_mb:.0f} MB -> {abs_output}')
-        return True
+def download_video(m3u8_urls, output: str):
+    """Download video via ffmpeg. Accepts a single URL or a list of CDN candidates.
 
-    print(f'  ERROR: output file not created')
+    vkvideo returns several hosts for the same segment; the first often 403s, so
+    fall through the list until one succeeds. Note: no ``-fflags +igndts`` — that
+    flag makes ffmpeg regenerate DTS at 1/90000 steps and destroys intra-segment
+    timing, producing choppy ("glued") playback.
+    """
+    if isinstance(m3u8_urls, str):
+        m3u8_urls = [m3u8_urls]
+
+    abs_output = os.path.abspath(output)
+    print(f'  Downloading with ffmpeg...')
+
+    last_err = ''
+    for i, url in enumerate(m3u8_urls):
+        ok, err = _ffmpeg_download(url, abs_output)
+        if ok and os.path.exists(abs_output):
+            size_mb = os.path.getsize(abs_output) / (1024 * 1024)
+            print(f'  Done! {size_mb:.0f} MB -> {abs_output}')
+            return True
+        last_err = err
+        if i + 1 < len(m3u8_urls):
+            host = url.split('/')[2] if '://' in url else url[:40]
+            print(f'  Host {host} failed, trying next CDN...')
+
+    stderr_tail = last_err[-600:] if last_err else ''
+    print(f'  ffmpeg error: {stderr_tail}')
     return False
 
 
