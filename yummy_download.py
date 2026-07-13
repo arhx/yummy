@@ -136,13 +136,11 @@ def download_kodik_episode(episode_url: str, output: str, quality: str = None):
 
 
 def download_alloha_episode(episode_url: str, output: str, quality: str = None, pw_context=None, dub: str = None):
-    # Alloha is fMP4/CMAF behind an aggressively rate-limited CDN; download the
-    # whole episode fragment-by-fragment through the browser session (resumable).
-    # max_stuck low so a currently-undownloadable episode (e.g. one in a temporary
-    # per-IP penalty) gives up in a few minutes and the loop moves to the next one.
+    # Alloha is fMP4/CMAF; download the whole episode fragment-by-fragment through
+    # the headed player session (resumable). A blocked/banned episode is skipped
+    # immediately so the loop moves straight to the next one.
     return alloha_download.download_episode(
-        episode_url, output, pw_context, quality=quality, dub_hint=dub,
-        cooldown=60, max_stuck=3, log=log,
+        episode_url, output, pw_context, quality=quality, dub_hint=dub, log=log,
     )
 
 

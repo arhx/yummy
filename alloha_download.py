@@ -278,19 +278,19 @@ def _capture_bnsi(pw_context, iframe_url: str, timeout: int = 60000, log=print):
                 pass
         resp = resp_info.value
         if resp.status != 200:
-            return None, auth
+            return None, auth, False
         # Wait (up to ~50 s, covers the preroll ad) until the player really plays:
-        # it has both sent the auth token AND pulled a segment with 200.
+        # it has both sent the auth token AND pulled a segment with 200. If it never
+        # reaches playback, the episode is banned/broken (the real player errors on
+        # it too) and the caller should SKIP it rather than retry.
         for _ in range(100):
             if auth.get('authorizations') and played['ok'] >= 1:
                 break
             page.wait_for_timeout(500)
-        if played['ok'] == 0:
-            log('  (player never reached playback — run HEADED; content may not download)')
-        return json.loads(resp.body().decode('utf-8')), auth
+        return json.loads(resp.body().decode('utf-8')), auth, played['ok'] >= 1
     except Exception as e:
         print(f'  bnsi capture error: {e}')
-        return None, auth
+        return None, auth, False
     finally:
         for ev, cb in (('request', _on_req), ('response', _on_resp)):
             try:
@@ -306,14 +306,15 @@ def _http_get(pw_context, url: str, referer: str = 'https://alloha.yani.tv/',
 
 
 def _resolve_playlist(pw_context, iframe_url: str, quality: str | None, dub_hint: str | None):
-    """Fetch a fresh signed token; return (init_url, [seg_urls], chosen_quality, label, auth).
+    """Fetch a fresh signed token; return (init_url, [seg_urls], chosen_quality, label, auth, played).
 
     `auth` is the per-movie header set sniffed from the live player (authorizations
     / accepts-controls / client hints) — pass it to every CDN request for unlimited
-    download. Returns None on failure. Segment order/count are stable across calls,
-    so a refreshed token lets us resume the same fragment list from a new signature.
+    download. `played` is True only if the player actually reached playback (fetched
+    a segment); if False the episode is banned/broken and the caller should skip it.
+    Returns None on failure.
     """
-    data, auth = _capture_bnsi(pw_context, iframe_url)
+    data, auth, played = _capture_bnsi(pw_context, iframe_url)
     if not data:
         return None
 
@@ -359,7 +360,7 @@ def _resolve_playlist(pw_context, iframe_url: str, quality: str | None, dub_hint
             elif line and not line.startswith('#'):
                 segs.append(line if line.startswith('http') else mbase + '/' + line)
         if init_url and segs:
-            return init_url, segs, chosen, src.get('label', ''), auth
+            return init_url, segs, chosen, src.get('label', ''), auth, played
     return None
 
 
@@ -388,47 +389,36 @@ def _assemble(init_path: str, parts_dir: str, n: int, abs_out: str) -> bool:
 
 
 def download_episode(iframe_url: str, output: str, pw_context, quality: str | None = None,
-                     dub_hint: str | None = None, pace: float = 0.3, cooldown: int = 120,
-                     max_stuck: int = 8, log=print) -> bool:
+                     dub_hint: str | None = None, pace: float = 0.3, log=print, **_ignored) -> bool:
     """Download a full Alloha fMP4 episode fragment-by-fragment. Resumable.
 
-    With the full real-player header set INCLUDING the per-movie auth tokens
-    (authorizations / accepts-controls, sniffed live in _capture_bnsi) the vkvideo
-    CDN does not throttle us at all — verified 238/238 fragments back-to-back with
-    zero 403. So we download at full speed; the cooldown/refresh path is only a
-    safety net for token expiry.
+    Requires a HEADED browser: the CDN only serves us once the live player has
+    actually reached playback (past the preroll ad). If it does, we grab the
+    per-movie auth tokens and download the whole episode at full speed with zero
+    403 (verified 239/239). If the player never reaches playback, or the CDN
+    returns 403 mid-download, the episode is currently blocked (per-IP penalty —
+    it errors in the real player too), so we SKIP IT IMMEDIATELY (no cooldown, no
+    token-refresh — that does not help) and let the caller move to the next
+    episode. Already-fetched fragments stay cached, so a later re-run resumes.
 
-    pace      seconds to wait between successful fragments (small = fast)
-    cooldown  seconds of silence after an unexpected 403 before refreshing token
-    max_stuck consecutive cooldowns without progress before giving up (resumable)
+    Returns True on a complete download, False if the episode was skipped.
     """
     abs_out = os.path.abspath(output)
     parts_dir = abs_out + '.parts'
     os.makedirs(parts_dir, exist_ok=True)
     init_path = os.path.join(parts_dir, 'init.mp4')
 
-    def resolve_with_retry(stuck_start=0):
-        """Resolve the playlist, cooling down + retrying while the CDN throttles us."""
-        stuck = stuck_start
-        while True:
-            pl = _resolve_playlist(pw_context, iframe_url, quality, dub_hint)
-            if pl:
-                return pl
-            stuck += 1
-            if stuck > max_stuck:
-                return None
-            wait = cooldown * min(stuck, 3)
-            log(f'  Playlist unavailable (throttled). Cooldown {wait}s (#{stuck})...')
-            time.sleep(wait)
-
-    pl = resolve_with_retry()
+    pl = _resolve_playlist(pw_context, iframe_url, quality, dub_hint)
     if not pl:
-        log('  ERROR: could not resolve playlist (still throttled after retries; re-run to resume)')
+        log('  SKIP: could not load player/playlist (blocked or offline)')
         return False
-    init_url, segs, chosen, label, auth = pl
+    init_url, segs, chosen, label, auth, played = pl
     n = len(segs)
-    tok = 'auth OK' if auth.get('authorizations') else 'NO auth token (may throttle)'
-    log(f'  Quality {chosen}p | Track: {label} | {n} fragments (~{n * 6 // 60} min) | {tok}')
+    if not played:
+        log(f'  SKIP: episode blocked — player never reached playback '
+            f'(banned/penalty; errors in the real player too). Re-run later.')
+        return False
+    log(f'  Quality {chosen}p | Track: {label} | {n} fragments (~{n * 6 // 60} min) | auth OK')
 
     def fetch_to(url, path) -> int:
         try:
@@ -450,42 +440,26 @@ def download_episode(iframe_url: str, output: str, pw_context, quality: str | No
     if not have(init_path):
         fetch_to(init_url, init_path)
 
-    i, stuck = 0, 0
     already = sum(1 for j in range(n) if have(os.path.join(parts_dir, f'seg_{j:04d}.m4s')))
     if already:
         log(f'  Resuming: {already}/{n} fragments already cached')
 
-    while i < n:
+    for i in range(n):
         part = os.path.join(parts_dir, f'seg_{i:04d}.m4s')
         if have(part):
-            i += 1
             continue
-        if not have(init_path):
-            fetch_to(init_url, init_path)
         st = fetch_to(segs[i], part)
-        if st == 200:
-            i += 1
-            stuck = 0
-            if i % 20 == 0 or i == n:
-                log(f'  {i}/{n} fragments')
-            time.sleep(pace)
-            continue
-
-        stuck += 1
-        if stuck > max_stuck:
-            log(f'  Giving up at {i}/{n} after {stuck} cooldowns. Re-run to resume.')
+        if st != 200:
+            log(f'  SKIP: HTTP {st} at fragment {i + 1}/{n} — CDN blocked this episode '
+                f'({i} cached, re-run later to resume)')
             return False
-        wait = cooldown * min(stuck, 3)
-        log(f'  Fragment {i + 1}/{n}: HTTP {st} (throttled). Cooldown {wait}s (#{stuck}), refreshing token...')
-        time.sleep(wait)
-        pl = _resolve_playlist(pw_context, iframe_url, chosen, dub_hint)
-        if pl and len(pl[1]) == n:
-            init_url, segs, chosen, label, auth = pl
+        if (i + 1) % 20 == 0 or i + 1 == n:
+            log(f'  {i + 1}/{n} fragments')
+        time.sleep(pace)
 
     # All fragments cached -> assemble (raw byte-concat, NO ffmpeg remux).
     log('  Assembling...')
-    ok = _assemble(init_path, parts_dir, n, abs_out)
-    if ok:
+    if _assemble(init_path, parts_dir, n, abs_out):
         size_mb = os.path.getsize(abs_out) / (1024 * 1024)
         log(f'  Done! {size_mb:.0f} MB, {n} fragments -> {abs_out}')
         try:
@@ -495,7 +469,7 @@ def download_episode(iframe_url: str, output: str, pw_context, quality: str | No
         except Exception:
             pass
         return True
-    log(f'  ffmpeg remux failed: {proc.stderr[-400:]}')
+    log('  ERROR: assembly failed')
     return False
 
 
