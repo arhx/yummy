@@ -192,6 +192,313 @@ def download_video(m3u8_urls, output: str):
     return False
 
 
+# ---------------------------------------------------------------------------
+# Fragment-level downloader.
+#
+# Alloha serves fMP4/CMAF HLS (init.mp4 + hundreds of .m4s fragments). ffmpeg
+# and yt-dlp mis-handle the per-fragment DTS reset, so we pull every fragment
+# through the Playwright session, byte-concat init + fragments and remux to a
+# flat mp4. Fully resumable.
+#
+# CRITICAL — request fingerprint: the vkvideo CDN classifies requests by their
+# browser headers. Requests WITHOUT the browser `sec-fetch-*` headers (i.e. a
+# bare scripted GET) are treated as a bot and hard-throttled to ~65-80 requests
+# before a multi-minute per-IP 403 ban. The real hls.js player sends the full
+# fetch fingerprint and is never throttled (it bursts 18 segments in 6 s fine).
+# So we replicate the player's EXACT headers — sec-fetch-*, `accept: */*`,
+# `accept-encoding: ...zstd`, and the FULL iframe URL as Referer — and then the
+# CDN lets us download at full speed. This was the root cause of all the 403s.
+# ---------------------------------------------------------------------------
+
+def _player_headers(referer: str, extra: dict | None = None) -> dict:
+    """Exact header set the real hls.js player sends to the vkvideo CDN.
+
+    `referer` must be the full Alloha iframe URL. `extra` carries the per-movie
+    auth tokens captured from the live player (``authorizations``,
+    ``accepts-controls``) plus client hints — WITHOUT these the CDN throttles us
+    to ~80 requests then a per-IP 403 ban; WITH them the download is unlimited.
+    """
+    h = {
+        'accept': '*/*',
+        'accept-encoding': 'gzip, deflate, br, zstd',
+        'origin': 'https://alloha.yani.tv',
+        'referer': referer,
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+    }
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _capture_bnsi(pw_context, iframe_url: str, timeout: int = 60000, log=print):
+    """Load the real player (HEADED — see note) and return (bnsi_data, auth_headers).
+
+    IMPORTANT: run the browser context HEADED. The CDN only honours our requests
+    once the player has ACTUALLY reached playback — i.e. it played through the
+    preroll ad and fetched a real segment with HTTP 200, establishing a valid
+    session. In headless the player often fails at the ad and never establishes
+    the session, so the sniffed auth tokens 403 anyway. So here we wait until the
+    player itself fetches a segment successfully before returning.
+    """
+    import json
+    auth = {}
+    played = {'ok': 0}
+    _AUTH_KEYS = ('authorizations', 'accepts-controls', 'accept-language',
+                  'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform')
+
+    def _on_req(r):
+        if 'vkvideo.cloud' in r.url and 'authorizations' not in auth:
+            try:
+                h = r.all_headers()
+            except Exception:
+                return
+            if 'authorizations' in h:
+                for k in _AUTH_KEYS:
+                    if h.get(k):
+                        auth[k] = h[k]
+
+    def _on_resp(r):
+        u = r.url
+        if 'vkvideo.cloud' in u and ('.m4s' in u or 'seg-' in u) and r.status == 200:
+            played['ok'] += 1
+
+    pw_context.on('request', _on_req)
+    pw_context.on('response', _on_resp)
+    page = pw_context.new_page()
+    page.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+    try:
+        with page.expect_response(lambda r: 'bnsi' in r.url, timeout=timeout) as resp_info:
+            page.goto(f'http://127.0.0.1:{_wrapper_port}/{iframe_url}', wait_until='load', timeout=30000)
+            try:
+                page.wait_for_timeout(1200)
+                page.mouse.click(640, 400)
+            except Exception:
+                pass
+        resp = resp_info.value
+        if resp.status != 200:
+            return None, auth
+        # Wait (up to ~50 s, covers the preroll ad) until the player really plays:
+        # it has both sent the auth token AND pulled a segment with 200.
+        for _ in range(100):
+            if auth.get('authorizations') and played['ok'] >= 1:
+                break
+            page.wait_for_timeout(500)
+        if played['ok'] == 0:
+            log('  (player never reached playback — run HEADED; content may not download)')
+        return json.loads(resp.body().decode('utf-8')), auth
+    except Exception as e:
+        print(f'  bnsi capture error: {e}')
+        return None, auth
+    finally:
+        for ev, cb in (('request', _on_req), ('response', _on_resp)):
+            try:
+                pw_context.remove_listener(ev, cb)
+            except Exception:
+                pass
+        page.close()
+
+
+def _http_get(pw_context, url: str, referer: str = 'https://alloha.yani.tv/',
+              extra: dict | None = None, timeout: int = 30000):
+    return pw_context.request.get(url, headers=_player_headers(referer, extra), timeout=timeout)
+
+
+def _resolve_playlist(pw_context, iframe_url: str, quality: str | None, dub_hint: str | None):
+    """Fetch a fresh signed token; return (init_url, [seg_urls], chosen_quality, label, auth).
+
+    `auth` is the per-movie header set sniffed from the live player (authorizations
+    / accepts-controls / client hints) — pass it to every CDN request for unlimited
+    download. Returns None on failure. Segment order/count are stable across calls,
+    so a refreshed token lets us resume the same fragment list from a new signature.
+    """
+    data, auth = _capture_bnsi(pw_context, iframe_url)
+    if not data:
+        return None
+
+    src = _pick_source(data.get('hlsSource', []), dub_hint)
+    qmap = {}
+    for res, urls_str in src.get('quality', {}).items():
+        urls = [u.strip() for u in urls_str.split(' or ') if u.strip()]
+        if urls:
+            qmap[res.rstrip('p')] = urls
+    if not qmap:
+        return None
+
+    chosen = quality if (quality and quality in qmap) else max(qmap, key=int)
+
+    for master_url in qmap[chosen]:
+        try:
+            r = _http_get(pw_context, master_url, referer=iframe_url, extra=auth)
+        except Exception:
+            continue
+        if r.status != 200:
+            continue
+        base = master_url.rsplit('/', 1)[0]
+        media_rel = next((l.strip() for l in r.text().splitlines()
+                          if l.strip() and not l.startswith('#')), None)
+        if not media_rel:
+            continue
+        media_url = media_rel if media_rel.startswith('http') else base + '/' + media_rel
+        try:
+            rm = _http_get(pw_context, media_url, referer=iframe_url, extra=auth)
+        except Exception:
+            continue
+        if rm.status != 200:
+            continue
+        mbase = media_url.rsplit('/', 1)[0]
+        init_url, segs = None, []
+        for line in rm.text().splitlines():
+            line = line.strip()
+            if line.startswith('#EXT-X-MAP'):
+                m = re.search(r'URI="([^"]+)"', line)
+                if m:
+                    u = m.group(1)
+                    init_url = u if u.startswith('http') else mbase + '/' + u
+            elif line and not line.startswith('#'):
+                segs.append(line if line.startswith('http') else mbase + '/' + line)
+        if init_url and segs:
+            return init_url, segs, chosen, src.get('label', ''), auth
+    return None
+
+
+def _assemble(init_path: str, parts_dir: str, n: int, abs_out: str) -> bool:
+    """Assemble the final mp4 = raw byte-concat of init + fragments IN ORDER.
+
+    IMPORTANT: do NOT run this through ffmpeg. These CMAF fragments each carry an
+    absolute `tfdt`, so a plain byte-concat (init.mp4 + seg_0000.m4s + seg_0001.m4s
+    + ...) is already a valid fragmented mp4 whose timestamps ffprobe/players read
+    correctly. Any `ffmpeg -c copy` remux (to mp4/mkv, with or without -copyts)
+    COLLAPSES every fragment's per-segment timestamps onto one PTS — the video then
+    freezes ~1 s into each 6 s segment and jumps ahead while audio keeps playing.
+    Re-muxing / raw-h264 re-timing was the cause of the "choppy" output; the fix is
+    to just concatenate the bytes and ship that.
+    """
+    try:
+        with open(abs_out, 'wb') as out:
+            with open(init_path, 'rb') as f:
+                out.write(f.read())
+            for j in range(n):
+                with open(os.path.join(parts_dir, f'seg_{j:04d}.m4s'), 'rb') as f:
+                    out.write(f.read())
+    except Exception:
+        return False
+    return os.path.exists(abs_out) and os.path.getsize(abs_out) > 1024 * 1024
+
+
+def download_episode(iframe_url: str, output: str, pw_context, quality: str | None = None,
+                     dub_hint: str | None = None, pace: float = 0.3, cooldown: int = 120,
+                     max_stuck: int = 8, log=print) -> bool:
+    """Download a full Alloha fMP4 episode fragment-by-fragment. Resumable.
+
+    With the full real-player header set INCLUDING the per-movie auth tokens
+    (authorizations / accepts-controls, sniffed live in _capture_bnsi) the vkvideo
+    CDN does not throttle us at all — verified 238/238 fragments back-to-back with
+    zero 403. So we download at full speed; the cooldown/refresh path is only a
+    safety net for token expiry.
+
+    pace      seconds to wait between successful fragments (small = fast)
+    cooldown  seconds of silence after an unexpected 403 before refreshing token
+    max_stuck consecutive cooldowns without progress before giving up (resumable)
+    """
+    abs_out = os.path.abspath(output)
+    parts_dir = abs_out + '.parts'
+    os.makedirs(parts_dir, exist_ok=True)
+    init_path = os.path.join(parts_dir, 'init.mp4')
+
+    def resolve_with_retry(stuck_start=0):
+        """Resolve the playlist, cooling down + retrying while the CDN throttles us."""
+        stuck = stuck_start
+        while True:
+            pl = _resolve_playlist(pw_context, iframe_url, quality, dub_hint)
+            if pl:
+                return pl
+            stuck += 1
+            if stuck > max_stuck:
+                return None
+            wait = cooldown * min(stuck, 3)
+            log(f'  Playlist unavailable (throttled). Cooldown {wait}s (#{stuck})...')
+            time.sleep(wait)
+
+    pl = resolve_with_retry()
+    if not pl:
+        log('  ERROR: could not resolve playlist (still throttled after retries; re-run to resume)')
+        return False
+    init_url, segs, chosen, label, auth = pl
+    n = len(segs)
+    tok = 'auth OK' if auth.get('authorizations') else 'NO auth token (may throttle)'
+    log(f'  Quality {chosen}p | Track: {label} | {n} fragments (~{n * 6 // 60} min) | {tok}')
+
+    def fetch_to(url, path) -> int:
+        try:
+            r = _http_get(pw_context, url, referer=iframe_url, extra=auth)
+        except Exception:
+            return 0
+        if r.status == 200:
+            body = r.body()
+            if body:
+                with open(path, 'wb') as f:
+                    f.write(body)
+                return 200
+            return 0
+        return r.status
+
+    def have(path):
+        return os.path.exists(path) and os.path.getsize(path) > 0
+
+    if not have(init_path):
+        fetch_to(init_url, init_path)
+
+    i, stuck = 0, 0
+    already = sum(1 for j in range(n) if have(os.path.join(parts_dir, f'seg_{j:04d}.m4s')))
+    if already:
+        log(f'  Resuming: {already}/{n} fragments already cached')
+
+    while i < n:
+        part = os.path.join(parts_dir, f'seg_{i:04d}.m4s')
+        if have(part):
+            i += 1
+            continue
+        if not have(init_path):
+            fetch_to(init_url, init_path)
+        st = fetch_to(segs[i], part)
+        if st == 200:
+            i += 1
+            stuck = 0
+            if i % 20 == 0 or i == n:
+                log(f'  {i}/{n} fragments')
+            time.sleep(pace)
+            continue
+
+        stuck += 1
+        if stuck > max_stuck:
+            log(f'  Giving up at {i}/{n} after {stuck} cooldowns. Re-run to resume.')
+            return False
+        wait = cooldown * min(stuck, 3)
+        log(f'  Fragment {i + 1}/{n}: HTTP {st} (throttled). Cooldown {wait}s (#{stuck}), refreshing token...')
+        time.sleep(wait)
+        pl = _resolve_playlist(pw_context, iframe_url, chosen, dub_hint)
+        if pl and len(pl[1]) == n:
+            init_url, segs, chosen, label, auth = pl
+
+    # All fragments cached -> assemble (raw byte-concat, NO ffmpeg remux).
+    log('  Assembling...')
+    ok = _assemble(init_path, parts_dir, n, abs_out)
+    if ok:
+        size_mb = os.path.getsize(abs_out) / (1024 * 1024)
+        log(f'  Done! {size_mb:.0f} MB, {n} fragments -> {abs_out}')
+        try:
+            for fn in os.listdir(parts_dir):
+                os.remove(os.path.join(parts_dir, fn))
+            os.rmdir(parts_dir)
+        except Exception:
+            pass
+        return True
+    log(f'  ffmpeg remux failed: {proc.stderr[-400:]}')
+    return False
+
+
 def main():
     if len(sys.argv) < 2:
         print('Usage: python alloha_download.py <alloha_iframe_url> [quality] [output]')
@@ -208,25 +515,22 @@ def main():
     if not output.endswith('.mp4'):
         output += '.mp4'
 
-    print('[1/2] Getting video URLs via browser...')
-    info = get_video_info(iframe_url)
-    if not info:
-        print('ERROR: Could not get video URLs')
-        sys.exit(1)
-
-    qualities = info['qualities']
-    print(f'  Available: {", ".join(sorted(qualities.keys(), key=int))}p')
-
-    if quality and quality in qualities:
-        chosen = quality
-    else:
-        chosen = max(qualities.keys(), key=int)
-        if quality:
-            print(f'  {quality}p not available, using {chosen}p')
-
-    print(f'  Selected: {chosen}p')
-    print('[2/2] Downloading...')
-    download_video(qualities[chosen], output)
+    from playwright.sync_api import sync_playwright
+    _ensure_wrapper_server()
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(
+        headless=False, channel='chrome',
+        args=['--disable-blink-features=AutomationControlled', '--no-sandbox',
+              '--autoplay-policy=no-user-gesture-required'],
+    )
+    ctx = browser.new_context(user_agent=UA, ignore_https_errors=True,
+                              viewport={'width': 1280, 'height': 800})
+    try:
+        print('Downloading Alloha episode (fragment mode)...')
+        download_episode(iframe_url, output, ctx, quality=quality)
+    finally:
+        browser.close()
+        pw.stop()
 
 
 if __name__ == '__main__':

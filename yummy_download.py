@@ -123,20 +123,11 @@ def download_kodik_episode(episode_url: str, output: str, quality: str = None):
 
 
 def download_alloha_episode(episode_url: str, output: str, quality: str = None, pw_context=None, dub: str = None):
-    print(f'  Getting video URLs via browser...')
-    info = alloha_download.get_video_info(episode_url, pw_context=pw_context, dub_hint=dub)
-    if not info:
-        print(f'  ERROR: Could not get video URLs')
-        return
-
-    qualities = info['qualities']
-    if quality and quality in qualities:
-        chosen = quality
-    else:
-        chosen = max(qualities.keys(), key=int)
-
-    print(f'  Quality: {chosen}p  |  Track: {info.get("label", "?")}')
-    alloha_download.download_video(qualities[chosen], output)
+    # Alloha is fMP4/CMAF behind an aggressively rate-limited CDN; download the
+    # whole episode fragment-by-fragment through the browser session (resumable).
+    alloha_download.download_episode(
+        episode_url, output, pw_context, quality=quality, dub_hint=dub,
+    )
 
 
 def main():
