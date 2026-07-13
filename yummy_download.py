@@ -2,6 +2,7 @@ import re
 import sys
 import json
 import ssl
+import time
 import urllib.request
 import urllib.parse
 import os
@@ -9,6 +10,18 @@ from pathlib import Path
 
 import kodik_download
 import alloha_download
+
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'download.log')
+
+
+def log(msg=''):
+    """Print to console and append a timestamped line to download.log."""
+    print(msg)
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}\n')
+    except Exception:
+        pass
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -125,8 +138,11 @@ def download_kodik_episode(episode_url: str, output: str, quality: str = None):
 def download_alloha_episode(episode_url: str, output: str, quality: str = None, pw_context=None, dub: str = None):
     # Alloha is fMP4/CMAF behind an aggressively rate-limited CDN; download the
     # whole episode fragment-by-fragment through the browser session (resumable).
-    alloha_download.download_episode(
+    # max_stuck low so a currently-undownloadable episode (e.g. one in a temporary
+    # per-IP penalty) gives up in a few minutes and the loop moves to the next one.
+    return alloha_download.download_episode(
         episode_url, output, pw_context, quality=quality, dub_hint=dub,
+        cooldown=60, max_stuck=3, log=log,
     )
 
 
@@ -231,17 +247,25 @@ def main():
                 if os.path.exists(output):
                     size_mb = os.path.getsize(output) / (1024 * 1024)
                     if size_mb > 10:
-                        print(f'\n  Episode {ep_num} already exists ({size_mb:.0f} MB), skipping')
+                        log(f'\n  Episode {ep_num} already exists ({size_mb:.0f} MB), skipping')
                         continue
 
-                print(f'\n--- Episode {ep_num} [{player.upper()}] ---')
+                log(f'\n--- Episode {ep_num} [{player.upper()}] {key} ---')
+                t0 = time.time()
                 try:
                     if player == 'kodik':
                         download_kodik_episode(ep['url'], output, quality)
-                    elif player == 'alloha':
-                        download_alloha_episode(ep['url'], output, quality=quality, pw_context=pw_context, dub=dubbing)
+                        ok = os.path.exists(output)
+                    else:
+                        ok = download_alloha_episode(ep['url'], output, quality=quality,
+                                                     pw_context=pw_context, dub=dubbing)
+                    dt = (time.time() - t0) / 60
+                    if ok:
+                        log(f'  Episode {ep_num}: OK in {dt:.1f} min')
+                    else:
+                        log(f'  Episode {ep_num}: FAILED after {dt:.1f} min (skipping — re-run to resume)')
                 except Exception as e:
-                    print(f'  ERROR downloading episode {ep_num}: {e}')
+                    log(f'  ERROR downloading episode {ep_num}: {e}')
                     continue
     finally:
         if browser:

@@ -6,3 +6,4 @@ __pycache__/
 *.m3u8
 *.m4s
 *.parts/
+*.log
