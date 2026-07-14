@@ -389,17 +389,31 @@ def _assemble(init_path: str, parts_dir: str, n: int, abs_out: str) -> bool:
 
 
 def download_episode(iframe_url: str, output: str, pw_context, quality: str | None = None,
-                     dub_hint: str | None = None, pace: float = 0.3, log=print, **_ignored) -> bool:
+                     dub_hint: str | None = None, pace: float = 1.0, log=print, **_ignored) -> bool:
     """Download a full Alloha fMP4 episode fragment-by-fragment. Resumable.
 
     Requires a HEADED browser: the CDN only serves us once the live player has
     actually reached playback (past the preroll ad). If it does, we grab the
-    per-movie auth tokens and download the whole episode at full speed with zero
-    403 (verified 239/239). If the player never reaches playback, or the CDN
-    returns 403 mid-download, the episode is currently blocked (per-IP penalty —
-    it errors in the real player too), so we SKIP IT IMMEDIATELY (no cooldown, no
-    token-refresh — that does not help) and let the caller move to the next
-    episode. Already-fetched fragments stay cached, so a later re-run resumes.
+    per-movie auth tokens and download the episode. If the player never reaches
+    playback, or the CDN returns 403 mid-download, the episode is currently
+    blocked, so we SKIP IT IMMEDIATELY (no cooldown, no token-refresh — that does
+    not help) and let the caller move on. Already-fetched fragments stay cached,
+    so a later re-run resumes.
+
+    PACING — this is the whole ball game. The vkvideo CDN rate-limits each edge
+    with a token bucket whose refill rate equals real-time playback (~1 fragment
+    per 6 s of video). The real hls.js player pulls fragments only as it plays,
+    so it consumes at exactly the refill rate and NEVER drains the bucket — it
+    streams forever on any edge. A scripted downloader that bursts fragments back
+    to back drains the bucket (~48 tokens on a well-used edge) and then eats a
+    403. Slowing to one request per (download_time + `pace`) seconds keeps us near
+    the player's cadence and lets a full episode through. Do NOT try to go faster
+    with keep-alive / a single reused socket / a different HTTP client — every
+    variant (http.client, Node undici fetch, Playwright ctx.request) hits the
+    SAME ~48-58 cap on a used edge; it is a per-edge rate limit, not a TLS or
+    keep-alive artefact. The edges are pinned to the exit IP's region (three
+    unrelated anime route through the identical ~4 hosts), so a burned edge stays
+    burned until it refills or the IP region changes.
 
     Returns True on a complete download, False if the episode was skipped.
     """
@@ -455,6 +469,9 @@ def download_episode(iframe_url: str, output: str, pw_context, quality: str | No
             return False
         if (i + 1) % 20 == 0 or i + 1 == n:
             log(f'  {i + 1}/{n} fragments')
+        # Wait `pace` s AFTER the fragment finished downloading, so the real gap
+        # is (download_time + pace) — at most one request per second — keeping us
+        # under the CDN's real-time-rate token bucket. See the docstring.
         time.sleep(pace)
 
     # All fragments cached -> assemble (raw byte-concat, NO ffmpeg remux).
